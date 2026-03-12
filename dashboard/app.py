@@ -16,11 +16,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import pandas as pd
 import streamlit as st
+import logging
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
 
 import config
+
+log = logging.getLogger(__name__)
 from data.MarketData import (
     compute_returns, compute_covariance_matrix,
     compute_correlation_matrix, compute_summary_stats,
@@ -250,16 +253,69 @@ COLORS = {
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_data(show_spinner=False)
-def load_prices(tickers: tuple[str, ...]) -> pd.DataFrame:
-    price_path = os.path.join(config.DATA_DIR, config.PRICE_FILE)
-    if os.path.exists(price_path):
-        prices = pd.read_csv(price_path, index_col=0, parse_dates=True)
-        available = [t for t in tickers if t in prices.columns]
-        return prices[available]
+@st.cache_data(show_spinner=False, ttl=3600)   # cache 1 hour per unique ticker set
+def load_prices(tickers: tuple[str, ...]) -> tuple[pd.DataFrame, list[str]]:
+    """
+    Fetch prices from yfinance for exactly the tickers requested.
+    Returns (prices_df, failed_tickers) so the UI can warn the user.
+    Cached by ticker tuple — different ticker sets are independent.
+    Falls back to synthetic GBM only if yfinance is unavailable entirely.
+    """
+    failed = []
 
-    # fallback: synthetic
+    try:
+        import yfinance as yf
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            raw = yf.download(
+                list(tickers),
+                start    = config.START_DATE,
+                end      = config.END_DATE,
+                auto_adjust = True,
+                progress = False,
+            )
+
+        if raw.empty:
+            raise ValueError("yfinance returned empty data")
+
+        # Extract close prices
+        if isinstance(raw.columns, pd.MultiIndex):
+            prices = raw["Close"].copy()
+        else:
+            prices = raw[["Close"]].copy()
+            prices.columns = list(tickers)
+
+        prices.index = pd.to_datetime(prices.index)
+        prices = prices.dropna(axis=1, how="all")
+
+        # Identify any tickers that came back empty
+        failed = [t for t in tickers if t not in prices.columns]
+
+        # Drop columns with >20% NaN (likely delisted / wrong symbol)
+        nan_pct = prices.isna().mean()
+        bad     = nan_pct[nan_pct > 0.2].index.tolist()
+        if bad:
+            failed += bad
+            prices  = prices.drop(columns=bad)
+
+        prices = prices.ffill().dropna()
+
+        if prices.empty or len(prices.columns) == 0:
+            raise ValueError("No valid price data returned")
+
+        return prices, failed
+
+    except ImportError:
+        log.warning("yfinance not installed — using synthetic data")
+    except Exception as e:
+        log.warning("yfinance fetch failed: %s — using synthetic data", e)
+
+    # Fallback: synthetic (offline / yfinance broken)
     from data.Synthetic import generate_prices
-    return generate_prices(list(tickers))
+    prices = generate_prices(list(tickers))
+    return prices, []
 
 
 @st.cache_data(show_spinner=False)
@@ -273,7 +329,7 @@ def compute_all(
     max_turnover: float,
     allow_short:  bool,
 ):
-    prices       = load_prices(tickers)
+    prices, failed = load_prices(tickers)
     returns      = compute_returns(prices, save=False)
     cov_matrix   = compute_covariance_matrix(returns).values
     mean_returns = returns.mean().values * config.TRADING_DAYS
@@ -301,7 +357,7 @@ def compute_all(
         max_turnover=max_turnover,
     )
 
-    return returns, mean_returns, cov_matrix, corr_matrix, stats, mvp, max_sr, frontier
+    return returns, mean_returns, cov_matrix, corr_matrix, stats, mvp, max_sr, frontier, failed
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -442,12 +498,20 @@ with st.sidebar:
 
 tickers_key = tuple(sorted(selected_tickers))
 
-with st.spinner("Running optimisation engine..."):
+with st.spinner("Fetching market data & running optimisation..."):
     (returns, mean_returns, cov_matrix, corr_matrix,
-     stats, mvp, max_sr, frontier) = compute_all(
+     stats, mvp, max_sr, frontier, failed_tickers) = compute_all(
         tickers_key, rf_rate,
         min_weight, max_weight, max_sector,
         target_vol, max_turnover, allow_short,
+    )
+
+if failed_tickers:
+    st.warning(
+        f"⚠ Could not load data for: **{', '.join(failed_tickers)}** — "
+        "check the ticker symbols are valid Yahoo Finance codes. "
+        "These assets have been excluded from the analysis.",
+        icon="⚠️",
     )
 
 tickers = list(returns.columns)
@@ -1104,17 +1168,15 @@ with tab5:
     )
 
     with st.spinner("Running walk-forward backtest..."):
-        price_path = os.path.join(config.DATA_DIR, config.PRICE_FILE)
-        if os.path.exists(price_path):
-            bt_prices = pd.read_csv(price_path, index_col=0, parse_dates=True)
-            bt_prices = bt_prices[[t for t in tickers if t in bt_prices.columns]]
-        else:
-            from data.Synthetic import generate_prices
-            bt_prices = generate_prices()[tickers]
+        # Reuse the already-fetched prices from compute_all — no second download needed
+        bt_prices = returns.copy()
+        # Reconstruct price index from returns (cumulative product from 100)
+        bt_prices_raw, _ = load_prices(tickers_key)
+        bt_prices_raw = bt_prices_raw[[t for t in tickers if t in bt_prices_raw.columns]]
 
         try:
             bt_results, bt_weights = run_backtest(
-                bt_prices,
+                bt_prices_raw,
                 lookback_days = lookback_days,
                 rebal_freq    = rebal_freq,
                 initial_value = 1_000_000,
