@@ -284,7 +284,202 @@ def find_maximum_sharpe_portfolio(
     }
 
 
-# ── Results Formatting ────────────────────────────────────────────────────────
+
+# ── Constrained Optimisation ──────────────────────────────────────────────────
+
+def build_constraints(
+    mean_returns:   np.ndarray,
+    cov_matrix:     np.ndarray,
+    tickers:        list[str],
+    target_return:  float | None    = None,
+    min_weight:     float           = 0.0,
+    max_weight:     float           = 1.0,
+    max_sector:     float           = 1.0,
+    target_vol:     float | None    = None,
+    current_weights: np.ndarray | None = None,
+    max_turnover:   float           = 1.0,
+) -> tuple[list[dict], list[tuple]]:
+    """
+    Build the full constraint and bounds lists for scipy.optimize.
+
+    Professional constraints implemented:
+        1. Weights sum to 1                  (equality)
+        2. Target return (optional)          (equality)
+        3. Target volatility (optional)      (inequality: vol ≤ target)
+        4. Sector concentration limit        (inequality: sector ≤ max_sector)
+        5. Max turnover vs current portfolio (inequality: turnover ≤ max_turnover)
+
+    Returns
+    -------
+    constraints : list of scipy constraint dicts
+    bounds      : list of (min, max) tuples per asset
+    """
+    import config as _cfg
+
+    N = len(mean_returns)
+
+    # ── Bounds (per-asset min/max weight) ─────────────────────────────────────
+    bounds = [(min_weight, max_weight)] * N
+
+    # ── Constraints ───────────────────────────────────────────────────────────
+    constraints = [
+        {"type": "eq", "fun": lambda w: np.sum(w) - 1},    # weights sum to 1
+    ]
+
+    # Optional: hit a specific return target (used by efficient frontier)
+    if target_return is not None:
+        constraints.append({
+            "type": "eq",
+            "fun": lambda w, r=target_return: w @ mean_returns - r,
+        })
+
+    # Optional: portfolio volatility ≤ target_vol
+    if target_vol is not None:
+        constraints.append({
+            "type": "ineq",
+            "fun": lambda w: target_vol - portfolio_volatility(w, cov_matrix),
+        })
+
+    # Sector concentration: sum of weights in each sector ≤ max_sector
+    if max_sector < 1.0:
+        sector_map = _cfg.SECTOR_MAP
+        sectors_in_universe: dict[str, list[int]] = {}
+        for i, ticker in enumerate(tickers):
+            sector = sector_map.get(ticker, "Other")
+            sectors_in_universe.setdefault(sector, []).append(i)
+
+        for sector, indices in sectors_in_universe.items():
+            if len(indices) > 0:
+                idx = np.array(indices)
+                constraints.append({
+                    "type": "ineq",
+                    "fun": lambda w, ix=idx: max_sector - w[ix].sum(),
+                })
+
+    # Max turnover: L1 distance from current weights ≤ max_turnover
+    if max_turnover < 1.0 and current_weights is not None:
+        constraints.append({
+            "type": "ineq",
+            "fun": lambda w: max_turnover - np.sum(np.abs(w - current_weights)),
+        })
+
+    return constraints, bounds
+
+
+def find_maximum_sharpe_constrained(
+    mean_returns:    np.ndarray,
+    cov_matrix:      np.ndarray,
+    tickers:         list[str],
+    risk_free:       float           = config.RISK_FREE_RATE,
+    allow_short:     bool            = False,
+    min_weight:      float           = 0.0,
+    max_weight:      float           = 1.0,
+    max_sector:      float           = 1.0,
+    target_vol:      float | None    = None,
+    current_weights: np.ndarray | None = None,
+    max_turnover:    float           = 1.0,
+) -> dict:
+    """
+    Maximum Sharpe portfolio with full professional constraint set.
+    Falls back gracefully if constraints make the problem infeasible.
+    """
+    N = len(mean_returns)
+    w0 = np.ones(N) / N
+
+    constraints, bounds = build_constraints(
+        mean_returns    = mean_returns,
+        cov_matrix      = cov_matrix,
+        tickers         = tickers,
+        min_weight      = -1.0 if allow_short else min_weight,
+        max_weight      = max_weight,
+        max_sector      = max_sector,
+        target_vol      = target_vol,
+        current_weights = current_weights,
+        max_turnover    = max_turnover,
+    )
+
+    result = minimize(
+        fun         = lambda w: -sharpe_ratio(w, mean_returns, cov_matrix, risk_free),
+        x0          = w0,
+        method      = "SLSQP",
+        bounds      = bounds,
+        constraints = constraints,
+        options     = {"ftol": 1e-10, "maxiter": 1000},
+    )
+
+    w = np.clip(result.x, 0, 1)
+    w /= w.sum()
+
+    log.info(
+        "Constrained Max Sharpe — Vol: %.2f%%  Return: %.2f%%  Sharpe: %.3f",
+        portfolio_volatility(w, cov_matrix) * 100,
+        portfolio_return(w, mean_returns) * 100,
+        sharpe_ratio(w, mean_returns, cov_matrix, risk_free),
+    )
+
+    return {
+        "weights":    w,
+        "return":     portfolio_return(w, mean_returns),
+        "volatility": portfolio_volatility(w, cov_matrix),
+        "sharpe":     sharpe_ratio(w, mean_returns, cov_matrix, risk_free),
+        "label":      "Max Sharpe (Constrained)",
+    }
+
+
+def find_minimum_variance_constrained(
+    mean_returns:    np.ndarray,
+    cov_matrix:      np.ndarray,
+    tickers:         list[str],
+    allow_short:     bool            = False,
+    min_weight:      float           = 0.0,
+    max_weight:      float           = 1.0,
+    max_sector:      float           = 1.0,
+    target_vol:      float | None    = None,
+    current_weights: np.ndarray | None = None,
+    max_turnover:    float           = 1.0,
+) -> dict:
+    """Minimum variance portfolio with full professional constraint set."""
+    N = len(mean_returns)
+    w0 = np.ones(N) / N
+
+    constraints, bounds = build_constraints(
+        mean_returns    = mean_returns,
+        cov_matrix      = cov_matrix,
+        tickers         = tickers,
+        min_weight      = -1.0 if allow_short else min_weight,
+        max_weight      = max_weight,
+        max_sector      = max_sector,
+        target_vol      = target_vol,
+        current_weights = current_weights,
+        max_turnover    = max_turnover,
+    )
+
+    result = minimize(
+        fun         = lambda w: portfolio_volatility(w, cov_matrix),
+        x0          = w0,
+        method      = "SLSQP",
+        bounds      = bounds,
+        constraints = constraints,
+        options     = {"ftol": 1e-10, "maxiter": 1000},
+    )
+
+    w = np.clip(result.x, 0, 1)
+    w /= w.sum()
+
+    log.info(
+        "Constrained Min Variance — Vol: %.2f%%  Return: %.2f%%",
+        portfolio_volatility(w, cov_matrix) * 100,
+        portfolio_return(w, mean_returns) * 100,
+    )
+
+    return {
+        "weights":    w,
+        "return":     portfolio_return(w, mean_returns),
+        "volatility": portfolio_volatility(w, cov_matrix),
+        "sharpe":     sharpe_ratio(w, mean_returns, cov_matrix),
+        "label":      "Min Variance (Constrained)",
+    }
+
 
 def format_portfolio(
     portfolio:   dict,

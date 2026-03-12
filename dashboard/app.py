@@ -29,12 +29,17 @@ from optimisation.Markowitz import (
     compute_efficient_frontier,
     find_minimum_variance_portfolio,
     find_maximum_sharpe_portfolio,
+    find_maximum_sharpe_constrained,
+    find_minimum_variance_constrained,
     portfolio_return, portfolio_volatility, sharpe_ratio,
 )
 from risk.Analytics import (
     simulate_portfolio_paths, compute_drawdown_series,
     var_historical, var_parametric, var_monte_carlo,
     cvar_historical, cvar_parametric, rolling_volatility,
+)
+from backtest.rolling import (
+    run_backtest, compute_backtest_metrics, compute_rolling_metrics,
 )
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -258,17 +263,43 @@ def load_prices(tickers: tuple[str, ...]) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def compute_all(tickers: tuple[str, ...], rf_rate: float):
+def compute_all(
+    tickers:      tuple[str, ...],
+    rf_rate:      float,
+    min_weight:   float,
+    max_weight:   float,
+    max_sector:   float,
+    target_vol:   float | None,
+    max_turnover: float,
+    allow_short:  bool,
+):
     prices       = load_prices(tickers)
     returns      = compute_returns(prices, save=False)
     cov_matrix   = compute_covariance_matrix(returns).values
     mean_returns = returns.mean().values * config.TRADING_DAYS
     corr_matrix  = compute_correlation_matrix(returns)
     stats        = compute_summary_stats(returns)
+    tickers_list = list(returns.columns)
 
-    mvp    = find_minimum_variance_portfolio(mean_returns, cov_matrix)
-    max_sr = find_maximum_sharpe_portfolio(mean_returns, cov_matrix, risk_free=rf_rate)
-    frontier = compute_efficient_frontier(mean_returns, cov_matrix, n_points=250)
+    # Unconstrained frontier (for the cloud visualization)
+    mvp_base    = find_minimum_variance_portfolio(mean_returns, cov_matrix)
+    max_sr_base = find_maximum_sharpe_portfolio(mean_returns, cov_matrix, risk_free=rf_rate)
+    frontier    = compute_efficient_frontier(mean_returns, cov_matrix, n_points=250)
+
+    # Constrained portfolios (what the optimizer actually uses)
+    mvp    = find_minimum_variance_constrained(
+        mean_returns, cov_matrix, tickers_list,
+        min_weight=min_weight, max_weight=max_weight,
+        max_sector=max_sector, target_vol=target_vol,
+        max_turnover=max_turnover,
+    )
+    max_sr = find_maximum_sharpe_constrained(
+        mean_returns, cov_matrix, tickers_list,
+        risk_free=rf_rate,
+        min_weight=min_weight, max_weight=max_weight,
+        max_sector=max_sector, target_vol=target_vol,
+        max_turnover=max_turnover,
+    )
 
     return returns, mean_returns, cov_matrix, corr_matrix, stats, mvp, max_sr, frontier
 
@@ -285,18 +316,16 @@ with st.sidebar:
 
     # ── Universe ──────────────────────────────────────────────────────────────
     st.markdown("### Universe")
-    ALL_TICKERS = ["AAPL", "MSFT", "JPM", "JNJ", "XOM", "GLD", "TLT",
-                   "AMZN", "GOOGL", "META", "NVDA", "BRK-B", "UNH", "V"]
 
-    selected_tickers = st.multiselect(
-        "Select assets",
-        options   = ALL_TICKERS,
-        default   = config.DEFAULT_TICKERS[:-1],   # exclude SPY
-        help      = "Choose 3–10 assets for the optimisation universe",
+    raw_input = st.text_input(
+        "Enter tickers (comma-separated)",
+        value = ", ".join(config.DEFAULT_TICKERS[:-1]),
+        help  = "Any valid Yahoo Finance ticker — e.g. AAPL, TSLA, BTC-USD, EURUSD=X",
     )
+    selected_tickers = [t.strip().upper() for t in raw_input.split(",") if t.strip()]
 
     if len(selected_tickers) < 3:
-        st.error("Select at least 3 assets.")
+        st.error("Enter at least 3 tickers.")
         st.stop()
 
     # ── Parameters ────────────────────────────────────────────────────────────
@@ -329,8 +358,71 @@ with st.sidebar:
         value   = 1000,
     )
 
+    st.markdown("### Backtest")
+    lookback_days = st.select_slider(
+        "Estimation Window",
+        options=[63, 126, 252, 504],
+        value=252,
+        format_func=lambda x: {63:"3 months", 126:"6 months", 252:"1 year", 504:"2 years"}[x],
+    )
+    rebal_freq = st.selectbox(
+        "Rebalancing Frequency",
+        options=["monthly", "quarterly", "semi-annual", "annual"],
+        index=1,
+    )
     st.markdown("### Constraints")
+
     allow_short = st.toggle("Allow Short Selling", value=False)
+
+    st.markdown("**Position Limits**")
+    col_min, col_max = st.columns(2)
+    with col_min:
+        min_weight = st.number_input(
+            "Min weight (%)", min_value=0, max_value=20,
+            value=0, step=1,
+            help="Minimum allocation per asset. Set >0 to force diversification.",
+        ) / 100
+    with col_max:
+        max_weight = st.number_input(
+            "Max weight (%)", min_value=10, max_value=100,
+            value=100, step=5,
+            help="Maximum allocation per asset. Prevents concentration.",
+        ) / 100
+
+    st.markdown("**Sector Exposure**")
+    max_sector = st.slider(
+        "Max sector concentration (%)",
+        min_value=10, max_value=100,
+        value=100, step=5,
+        format="%d%%",
+        help="Caps total exposure to any single GICS sector.",
+    ) / 100
+
+    st.markdown("**Volatility Target**")
+    use_target_vol = st.toggle("Enable volatility target", value=False)
+    target_vol = None
+    if use_target_vol:
+        target_vol = st.slider(
+            "Target Ann. Volatility (%)",
+            min_value=5, max_value=40,
+            value=15, step=1,
+            format="%d%%",
+            help="Portfolio volatility will be constrained to ≤ this level.",
+        ) / 100
+
+    st.markdown("**Turnover**")
+    use_turnover = st.toggle("Limit turnover", value=False)
+    max_turnover = 1.0
+    if use_turnover:
+        max_turnover = st.slider(
+            "Max turnover per rebalance (%)",
+            min_value=10, max_value=100,
+            value=50, step=5,
+            format="%d%%",
+            help="Limits how much the portfolio can change at each rebalance. Reduces transaction costs.",
+        ) / 100
+
+    max_weight_bt = max_weight   # backtest inherits position limit from constraints
 
     st.markdown("---")
     st.markdown(
@@ -352,7 +444,11 @@ tickers_key = tuple(sorted(selected_tickers))
 
 with st.spinner("Running optimisation engine..."):
     (returns, mean_returns, cov_matrix, corr_matrix,
-     stats, mvp, max_sr, frontier) = compute_all(tickers_key, rf_rate)
+     stats, mvp, max_sr, frontier) = compute_all(
+        tickers_key, rf_rate,
+        min_weight, max_weight, max_sector,
+        target_vol, max_turnover, allow_short,
+    )
 
 tickers = list(returns.columns)
 N       = len(tickers)
@@ -398,7 +494,7 @@ kpi(k2, "Max Sharpe Vol",
 kpi(k3, "Min Var Volatility",
     f"{mvp['volatility']*100:.1f}%",
     f"SR = {mvp['sharpe']:.2f}", "#00ff9d")
-kpi(k4, "VaR 95% (Max SR)",
+kpi(k4, f"VaR {int(confidence*100)}% (Max SR)",
     f"{var_historical(maxsr_returns, confidence)*100:.2f}%",
     f"1-day · {int(confidence*100)}% conf", "#ff4d6d")
 kpi(k5, "Assets in Universe",
@@ -412,11 +508,12 @@ st.markdown("<br>", unsafe_allow_html=True)
 # TABS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "⬡  Efficient Frontier",
     "◈  Risk Analytics",
     "◎  Monte Carlo",
     "⊞  Asset Universe",
+    "⟳  Backtest",
 ])
 
 
@@ -425,124 +522,118 @@ tab1, tab2, tab3, tab4 = st.tabs([
 # ───────────────────────────────────────────────────────────────────────────────
 with tab1:
 
-    col_left, col_right = st.columns([2, 1])
+    st.markdown('<div class="section-header">Efficient Frontier · Capital Market Line</div>',
+                unsafe_allow_html=True)
+
+    fig = go.Figure()
+
+    # ── Random portfolio cloud ────────────────────────────────────────────────
+    rng = np.random.default_rng(42)
+    n_random = 4000
+    rand_weights = rng.dirichlet(np.ones(N), size=n_random)
+    rand_rets    = rand_weights @ mean_returns * 100
+    rand_vols    = np.array([np.sqrt(w @ cov_matrix @ w) * 100 for w in rand_weights])
+    rand_sharpe  = (rand_rets / 100 - rf_rate) / (rand_vols / 100)
+
+    fig.add_trace(go.Scatter(
+        x=rand_vols, y=rand_rets, mode="markers",
+        marker=dict(
+            color=rand_sharpe, colorscale="RdYlGn",
+            size=3, opacity=0.45,
+            colorbar=dict(
+                title=dict(text="Sharpe", font=dict(color="#94a3b8", size=10)),
+                tickfont=dict(color="#94a3b8", size=9),
+                thickness=12, x=1.01,
+            ),
+            showscale=True,
+        ),
+        name="Random Portfolios", showlegend=True,
+        hovertemplate="Vol: %{x:.2f}%<br>Return: %{y:.2f}%<br>Sharpe: %{marker.color:.3f}<extra></extra>",
+    ))
+
+    # ── Efficient frontier boundary ───────────────────────────────────────────
+    mvp_vol   = mvp["volatility"] * 100
+    efficient = frontier[frontier["volatility"] * 100 >= mvp_vol]
+    fig.add_trace(go.Scatter(
+        x=efficient["volatility"] * 100, y=efficient["return"] * 100,
+        mode="lines", line=dict(color="#ffffff", width=2),
+        name="Efficient Frontier", showlegend=True,
+        hovertemplate="<b>Efficient Frontier</b><br>Vol: %{x:.2f}%<br>Return: %{y:.2f}%<extra></extra>",
+    ))
+
+    # ── Capital Market Line ───────────────────────────────────────────────────
+    tang_vol = max_sr["volatility"] * 100
+    tang_ret = max_sr["return"] * 100
+    rf_ret   = rf_rate * 100
+    slope    = (tang_ret - rf_ret) / tang_vol
+    cml_x    = np.linspace(0, tang_vol * 1.4, 100)
+    cml_y    = rf_ret + slope * cml_x
+    fig.add_trace(go.Scatter(
+        x=cml_x, y=cml_y, mode="lines",
+        line=dict(color=COLORS["max_sr"], width=1.5, dash="dash"),
+        name="Capital Market Line", hoverinfo="skip",
+    ))
+    fig.add_trace(go.Scatter(
+        x=[0], y=[rf_ret], mode="markers",
+        marker=dict(color=COLORS["max_sr"], size=10, symbol="circle"),
+        name=f"Risk-Free ({rf_rate*100:.1f}%)",
+        hovertemplate=f"Risk-Free Rate: {rf_ret:.1f}%<extra></extra>",
+    ))
+
+    # ── Individual assets ─────────────────────────────────────────────────────
+    for i, ticker in enumerate(tickers):
+        vol_i   = np.sqrt(cov_matrix[i, i]) * 100
+        ret_i   = mean_returns[i] * 100
+        color_i = COLORS["assets"][i % len(COLORS["assets"])]
+        fig.add_trace(go.Scatter(
+            x=[vol_i], y=[ret_i], mode="markers+text",
+            marker=dict(color=color_i, size=10, line=dict(color="#0d1117", width=1.5)),
+            text=[ticker], textposition="top right",
+            textfont=dict(size=10, color=color_i),
+            name=ticker, showlegend=False,
+            hovertemplate=f"<b>{ticker}</b><br>Vol: {vol_i:.1f}%<br>Return: {ret_i:.1f}%<extra></extra>",
+        ))
+
+    # ── Key portfolios ────────────────────────────────────────────────────────
+    for p, color, label in [
+        (mvp,    COLORS["mvp"],    "Min Variance"),
+        (max_sr, COLORS["max_sr"], "Max Sharpe"),
+    ]:
+        fig.add_trace(go.Scatter(
+            x=[p["volatility"] * 100], y=[p["return"] * 100],
+            mode="markers+text",
+            marker=dict(color=color, size=18, symbol="star", line=dict(color="#000", width=1)),
+            text=[label], textposition="top left",
+            textfont=dict(size=10, color=color),
+            name=label,
+            hovertemplate=(
+                f"<b>{label}</b><br>Vol: {p['volatility']*100:.2f}%<br>"
+                f"Return: {p['return']*100:.2f}%<br>Sharpe: {p['sharpe']:.3f}<extra></extra>"
+            ),
+        ))
+
+    fig.update_layout(
+        **PLOTLY_THEME, height=520,
+        legend=dict(
+            font=dict(size=9, color="#94a3b8"),
+            bgcolor="rgba(13,20,32,0.8)",
+            bordercolor="#1e2d3d", borderwidth=1,
+            x=0.01, y=0.99, xanchor="left", yanchor="top",
+        ),
+        xaxis_title="Annualised Volatility (%)",
+        yaxis_title="Annualised Return (%)",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ── Weights + Metrics side by side (below frontier) ───────────────────────
+    col_left, col_right = st.columns([1, 1])
 
     with col_left:
-        st.markdown('<div class="section-header">Efficient Frontier · Capital Market Line</div>',
-                    unsafe_allow_html=True)
-
-        fig = go.Figure()
-
-        # Frontier coloured by Sharpe
-        fig.add_trace(go.Scatter(
-            x    = frontier["volatility"] * 100,
-            y    = frontier["return"] * 100,
-            mode = "markers",
-            marker = dict(
-                color     = frontier["sharpe"],
-                colorscale= "Plasma",
-                size      = 5,
-                colorbar  = dict(
-                    title      = dict(text="Sharpe", font=dict(color="#94a3b8", size=10)),
-                    tickfont   = dict(color="#94a3b8", size=9),
-                    thickness  = 12,
-                ),
-                showscale = True,
-            ),
-            name       = "Efficient Frontier",
-            hovertemplate = (
-                "<b>Efficient Frontier</b><br>"
-                "Vol: %{x:.2f}%<br>Return: %{y:.2f}%<br>"
-                "Sharpe: %{marker.color:.3f}<extra></extra>"
-            ),
-        ))
-
-        # Capital Market Line
-        tang_vol = max_sr["volatility"] * 100
-        tang_ret = max_sr["return"] * 100
-        rf_ret   = rf_rate * 100
-        slope    = (tang_ret - rf_ret) / tang_vol
-        cml_x    = np.linspace(0, tang_vol * 1.4, 100)
-        cml_y    = rf_ret + slope * cml_x
-        fig.add_trace(go.Scatter(
-            x    = cml_x, y = cml_y,
-            mode = "lines",
-            line = dict(color=COLORS["max_sr"], width=1.5, dash="dash"),
-            name = "Capital Market Line",
-            hoverinfo = "skip",
-        ))
-
-        # Risk-free rate
-        fig.add_trace(go.Scatter(
-            x=[0], y=[rf_ret],
-            mode   = "markers",
-            marker = dict(color=COLORS["max_sr"], size=10, symbol="circle"),
-            name   = f"Risk-Free ({rf_rate*100:.1f}%)",
-            hovertemplate = f"Risk-Free Rate: {rf_ret:.1f}%<extra></extra>",
-        ))
-
-        # Individual assets
-        for i, ticker in enumerate(tickers):
-            vol_i = np.sqrt(cov_matrix[i, i]) * 100
-            ret_i = mean_returns[i] * 100
-            color_i = COLORS["assets"][i % len(COLORS["assets"])]
-            fig.add_trace(go.Scatter(
-                x    = [vol_i], y = [ret_i],
-                mode = "markers+text",
-                marker = dict(color=color_i, size=10,
-                              line=dict(color="#0d1117", width=1.5)),
-                text      = [ticker],
-                textposition = "top right",
-                textfont  = dict(size=10, color=color_i),
-                name      = ticker,
-                hovertemplate = (
-                    f"<b>{ticker}</b><br>Vol: {vol_i:.1f}%<br>"
-                    f"Return: {ret_i:.1f}%<extra></extra>"
-                ),
-            ))
-
-        # Key portfolios
-        for p, color, symbol, label in [
-            (mvp,    COLORS["mvp"],    "star",    "Min Variance"),
-            (max_sr, COLORS["max_sr"], "star",    "Max Sharpe"),
-        ]:
-            fig.add_trace(go.Scatter(
-                x    = [p["volatility"] * 100],
-                y    = [p["return"] * 100],
-                mode = "markers+text",
-                marker = dict(color=color, size=18, symbol=symbol,
-                              line=dict(color="#000", width=1)),
-                text = [label],
-                textposition = "top left",
-                textfont = dict(size=10, color=color),
-                name = label,
-                hovertemplate = (
-                    f"<b>{label}</b><br>"
-                    f"Vol: {p['volatility']*100:.2f}%<br>"
-                    f"Return: {p['return']*100:.2f}%<br>"
-                    f"Sharpe: {p['sharpe']:.3f}<extra></extra>"
-                ),
-            ))
-
-        fig.update_layout(
-            **PLOTLY_THEME,
-            height  = 500,
-            legend  = dict(font=dict(size=9, color="#94a3b8"),
-                           bgcolor="rgba(0,0,0,0)"),
-            xaxis_title = "Annualised Volatility (%)",
-            yaxis_title = "Annualised Return (%)",
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-    with col_right:
-        st.markdown('<div class="section-header">Portfolio Weights</div>',
-                    unsafe_allow_html=True)
+        st.markdown('<div class="section-header">Portfolio Weights</div>', unsafe_allow_html=True)
 
         port_choice = st.radio(
-            "View weights for",
-            ["Max Sharpe", "Min Variance"],
-            horizontal=True,
-            label_visibility="collapsed",
+            "View weights for", ["Max Sharpe", "Min Variance"],
+            horizontal=True, label_visibility="collapsed",
         )
         w_data = max_sr if port_choice == "Max Sharpe" else mvp
         color  = COLORS["max_sr"] if port_choice == "Max Sharpe" else COLORS["mvp"]
@@ -553,33 +644,31 @@ with tab1:
         }).sort_values("Weight", ascending=True)
 
         fig_w = go.Figure(go.Bar(
-            x           = weights_df["Weight"],
-            y           = weights_df["Asset"],
-            orientation = "h",
-            marker      = dict(
-                color   = weights_df["Weight"],
-                colorscale = [[0, "#1e2d3d"], [1, color]],
-                line    = dict(color="rgba(0,0,0,0)"),
+            x=weights_df["Weight"], y=weights_df["Asset"],
+            orientation="h",
+            marker=dict(
+                color=weights_df["Weight"],
+                colorscale=[[0, "#1e2d3d"], [1, color]],
+                line=dict(color="rgba(0,0,0,0)"),
             ),
-            text        = [f"{w:.1f}%" for w in weights_df["Weight"]],
-            textposition= "outside",
-            textfont    = dict(size=10, color="#94a3b8"),
-            hovertemplate = "%{y}: %{x:.2f}%<extra></extra>",
+            text=[f"{w:.1f}%" for w in weights_df["Weight"]],
+            textposition="outside",
+            textfont=dict(size=10, color="#94a3b8"),
+            hovertemplate="%{y}: %{x:.2f}%<extra></extra>",
         ))
         fig_w.update_layout(
-            **PLOTLY_THEME,
-            height      = 320,
-            showlegend  = False,
-            xaxis_title = "Weight (%)",
-            xaxis_range = [0, weights_df["Weight"].max() * 1.25],
+            **PLOTLY_THEME, height=320, showlegend=False,
+            xaxis_title="Weight (%)",
+            xaxis_range=[0, weights_df["Weight"].max() * 1.25],
         )
         st.plotly_chart(fig_w, use_container_width=True)
 
-        # Stats table for selected portfolio
+    with col_right:
         st.markdown('<div class="section-header">Key Metrics</div>', unsafe_allow_html=True)
         metrics_df = pd.DataFrame({
-            "Metric": ["Return", "Volatility", "Sharpe", "VaR 95%", "CVaR 95%"],
-            "Value":  [
+            "Metric": ["Return", "Volatility", "Sharpe",
+                       f"VaR {int(confidence*100)}%", f"CVaR {int(confidence*100)}%"],
+            "Value": [
                 f"{w_data['return']*100:.2f}%",
                 f"{w_data['volatility']*100:.2f}%",
                 f"{w_data['sharpe']:.3f}",
@@ -588,6 +677,44 @@ with tab1:
             ]
         })
         st.dataframe(metrics_df, hide_index=True, use_container_width=True)
+
+        # ── Sector breakdown ──────────────────────────────────────────────────
+        st.markdown('<div class="section-header">Sector Exposure</div>', unsafe_allow_html=True)
+        sector_map   = config.SECTOR_MAP
+        sector_colors = config.SECTOR_COLORS
+        sector_weights: dict[str, float] = {}
+        for ticker, weight in zip(tickers, w_data["weights"]):
+            sector = sector_map.get(ticker, "Other")
+            sector_weights[sector] = sector_weights.get(sector, 0) + weight * 100
+
+        if sector_weights:
+            sw_df = pd.DataFrame(
+                list(sector_weights.items()), columns=["Sector", "Weight (%)"]
+            ).sort_values("Weight (%)", ascending=False)
+            colors_sec = [sector_colors.get(s, "#64748b") for s in sw_df["Sector"]]
+            fig_sec = go.Figure(go.Bar(
+                x=sw_df["Weight (%)"], y=sw_df["Sector"],
+                orientation="h",
+                marker=dict(color=colors_sec, line=dict(color="rgba(0,0,0,0)")),
+                text=[f"{w:.1f}%" for w in sw_df["Weight (%)"]],
+                textposition="outside",
+                textfont=dict(size=10, color="#94a3b8"),
+                hovertemplate="%{y}: %{x:.1f}%<extra></extra>",
+            ))
+            if max_sector < 1.0:
+                fig_sec.add_vline(
+                    x=max_sector * 100,
+                    line=dict(color="#ff4d6d", width=1.5, dash="dash"),
+                    annotation_text=f"Sector cap ({max_sector*100:.0f}%)",
+                    annotation_font=dict(size=9, color="#ff4d6d"),
+                )
+            fig_sec.update_layout(
+                **PLOTLY_THEME, height=200 + len(sw_df) * 20,
+                showlegend=False,
+                xaxis_title="Exposure (%)",
+                xaxis_range=[0, max(sw_df["Weight (%)"]) * 1.3],
+            )
+            st.plotly_chart(fig_sec, use_container_width=True)
 
     # Cumulative returns comparison
     st.markdown('<div class="section-header">Cumulative Performance · All Portfolios vs Benchmark</div>',
@@ -645,7 +772,7 @@ with tab2:
             "Sharpe":         f"{(r.mean()*config.TRADING_DAYS - rf_rate)/(r.std()*np.sqrt(config.TRADING_DAYS)):.3f}",
             "VaR Hist (%)":   f"{var_historical(r, confidence)*100:.3f}%",
             "VaR Param (%)":  f"{var_parametric(r, confidence)*100:.3f}%",
-            "VaR MC (%)":     f"{var_monte_carlo(w, mean_returns, cov_matrix, confidence)*100:.3f}%",
+            "VaR MC (%)":     f"{var_monte_carlo(w, mean_returns, cov_matrix, confidence, n_simulations=2000)*100:.3f}%",
             "CVaR Hist (%)":  f"{cvar_historical(r, confidence)*100:.3f}%",
             "CVaR Param (%)": f"{cvar_parametric(r, confidence)*100:.3f}%",
             "Max DD (%)":     f"{compute_drawdown_series(r).min()*100:.2f}%",
@@ -955,3 +1082,187 @@ with tab4:
                              yaxis_title="Normalised Price (base=100)",
                              legend=dict(font=dict(size=9), bgcolor="rgba(0,0,0,0)"))
         st.plotly_chart(fig_px, use_container_width=True)
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# TAB 5 — Walk-Forward Backtest
+# ───────────────────────────────────────────────────────────────────────────────
+with tab5:
+
+    st.markdown('<div class="section-header">Walk-Forward Backtest · Out-of-Sample Performance</div>',
+                unsafe_allow_html=True)
+
+    st.markdown(
+        '<div style="font-family:Space Mono,monospace;font-size:0.72rem;color:#64748b;'
+        'background:#0d1420;border:1px solid #1e2d3d;border-radius:8px;padding:0.8rem 1rem;'
+        'margin-bottom:1rem;line-height:1.8;">'
+        '⚠  Walk-forward methodology: the optimizer is trained on a rolling <b style="color:#94a3b8">'
+        f'estimation window</b> of past data, then held for one <b style="color:#94a3b8">rebalancing period</b> '
+        'before re-optimizing. This eliminates look-ahead bias and produces a realistic out-of-sample track record.'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    with st.spinner("Running walk-forward backtest..."):
+        price_path = os.path.join(config.DATA_DIR, config.PRICE_FILE)
+        if os.path.exists(price_path):
+            bt_prices = pd.read_csv(price_path, index_col=0, parse_dates=True)
+            bt_prices = bt_prices[[t for t in tickers if t in bt_prices.columns]]
+        else:
+            from data.Synthetic import generate_prices
+            bt_prices = generate_prices()[tickers]
+
+        try:
+            bt_results, bt_weights = run_backtest(
+                bt_prices,
+                lookback_days = lookback_days,
+                rebal_freq    = rebal_freq,
+                initial_value = 1_000_000,
+                allow_short   = allow_short,
+                min_weight    = min_weight,
+                max_weight    = max_weight_bt,
+                max_sector    = max_sector,
+                target_vol    = target_vol,
+                max_turnover  = max_turnover,
+            )
+            bt_metrics  = compute_backtest_metrics(bt_results)
+            bt_rolling  = compute_rolling_metrics(bt_results)
+            backtest_ok = True
+        except ValueError as e:
+            st.error(f"Backtest error: {e}")
+            backtest_ok = False
+
+    if backtest_ok:
+
+        # ── Performance metrics table ─────────────────────────────────────────
+        st.markdown('<div class="section-header">Performance Summary</div>',
+                    unsafe_allow_html=True)
+
+        def color_metric(val, col):
+            if col in ["Total Return (%)", "CAGR (%)", "Sharpe", "Sortino",
+                       "Calmar", "Win Rate (%)", "Best Day (%)"]:
+                try:
+                    return "color: #00ff9d" if float(str(val).replace("%","")) > 0 else "color: #ff4d6d"
+                except: return ""
+            if col in ["Max Drawdown (%)", "Worst Day (%)"]:
+                return "color: #ff4d6d"
+            return ""
+
+        st.dataframe(
+            bt_metrics.style.apply(
+                lambda col: [color_metric(v, col.name) for v in col], axis=0
+            ),
+            use_container_width=True,
+        )
+
+        # ── Equity curves ─────────────────────────────────────────────────────
+        st.markdown('<div class="section-header">Equity Curves · $1,000,000 Initial Investment</div>',
+                    unsafe_allow_html=True)
+
+        fig_eq = go.Figure()
+        for name, color in [
+            ("Max Sharpe",   COLORS["max_sr"]),
+            ("Min Variance", COLORS["mvp"]),
+            ("Equal Weight", COLORS["eq_w"]),
+        ]:
+            df = bt_results[name]
+            fig_eq.add_trace(go.Scatter(
+                x    = df.index,
+                y    = df["portfolio_value"] / 1e6,
+                mode = "lines",
+                name = name,
+                line = dict(color=color, width=2),
+                hovertemplate = (
+                    f"<b>{name}</b><br>%{{x|%b %Y}}: $%{{y:.3f}}M<extra></extra>"
+                ),
+            ))
+
+        fig_eq.add_hline(y=1.0, line=dict(color="#334155", width=1, dash="dot"),
+                         annotation_text="Initial $1M",
+                         annotation_font=dict(color="#64748b", size=9))
+        fig_eq.update_layout(
+            **PLOTLY_THEME, height=360,
+            yaxis_title="Portfolio Value ($M)",
+            legend=dict(font=dict(size=10), bgcolor="rgba(0,0,0,0)"),
+        )
+        st.plotly_chart(fig_eq, use_container_width=True)
+
+        # ── Drawdown + Rolling Sharpe ─────────────────────────────────────────
+        col_dd, col_rs = st.columns(2)
+
+        with col_dd:
+            st.markdown('<div class="section-header">Drawdown · Out-of-Sample</div>',
+                        unsafe_allow_html=True)
+            fig_dd = go.Figure()
+            for name, color in [
+                ("Max Sharpe",   COLORS["max_sr"]),
+                ("Min Variance", COLORS["mvp"]),
+                ("Equal Weight", COLORS["eq_w"]),
+            ]:
+                dd = compute_drawdown_series(bt_results[name]["daily_return"]) * 100
+                _rgb = {"Max Sharpe":"255,215,0","Min Variance":"0,255,157","Equal Weight":"255,77,109"}
+                fig_dd.add_trace(go.Scatter(
+                    x=dd.index, y=dd.values,
+                    fill="tozeroy",
+                    fillcolor=f"rgba({_rgb[name]},0.1)",
+                    mode="lines", name=name,
+                    line=dict(color=color, width=1.5),
+                    hovertemplate=f"<b>{name}</b><br>%{{x|%b %Y}}: %{{y:.2f}}%<extra></extra>",
+                ))
+            fig_dd.update_layout(**PLOTLY_THEME, height=280,
+                                 yaxis_title="Drawdown (%)",
+                                 legend=dict(font=dict(size=9), bgcolor="rgba(0,0,0,0)"))
+            st.plotly_chart(fig_dd, use_container_width=True)
+
+        with col_rs:
+            st.markdown('<div class="section-header">Rolling 63-Day Sharpe</div>',
+                        unsafe_allow_html=True)
+            fig_rs = go.Figure()
+            for name, color in [
+                ("Max Sharpe",   COLORS["max_sr"]),
+                ("Min Variance", COLORS["mvp"]),
+                ("Equal Weight", COLORS["eq_w"]),
+            ]:
+                rs = bt_rolling[name]["rolling_sharpe"]
+                fig_rs.add_trace(go.Scatter(
+                    x=rs.index, y=rs.values,
+                    mode="lines", name=name,
+                    line=dict(color=color, width=1.5),
+                    hovertemplate=f"<b>{name}</b><br>%{{x|%b %Y}}: %{{y:.3f}}<extra></extra>",
+                ))
+            fig_rs.add_hline(y=0, line=dict(color="#475569", width=1, dash="dot"))
+            fig_rs.update_layout(**PLOTLY_THEME, height=280,
+                                 yaxis_title="Rolling Sharpe",
+                                 legend=dict(font=dict(size=9), bgcolor="rgba(0,0,0,0)"))
+            st.plotly_chart(fig_rs, use_container_width=True)
+
+        # ── Max Sharpe weight evolution ────────────────────────────────────────
+        st.markdown('<div class="section-header">Max Sharpe — Weight Allocation at Each Rebalance</div>',
+                    unsafe_allow_html=True)
+
+        weight_cols = [c for c in bt_weights.columns if c.startswith("w_")]
+        labels      = [c.replace("w_", "") for c in weight_cols]
+
+        # Keep only rebalancing dates (where weights actually changed)
+        rebal_dates = bt_weights[weight_cols].drop_duplicates()
+
+        fig_wt = go.Figure()
+        for col, label, color in zip(weight_cols, labels, COLORS["assets"]):
+            fig_wt.add_trace(go.Bar(
+                x    = rebal_dates.index,
+                y    = rebal_dates[col] * 100,
+                name = label,
+                marker_color = color,
+                hovertemplate = f"<b>{label}</b><br>%{{x|%b %Y}}: %{{y:.1f}}%<extra></extra>",
+            ))
+
+        fig_wt.update_layout(
+            **PLOTLY_THEME,
+            barmode   = "stack",
+            height    = 300,
+            yaxis_title = "Weight (%)",
+            yaxis_range = [0, 100],
+            legend    = dict(font=dict(size=9), bgcolor="rgba(0,0,0,0)"),
+            bargap    = 0.15,
+        )
+        st.plotly_chart(fig_wt, use_container_width=True)
