@@ -73,13 +73,16 @@ def run_backtest(
     max_sector:     float      = 1.0,
     target_vol:     float | None = None,
     max_turnover:   float      = 1.0,
+    spy_prices:     pd.Series | None = None,   # buy-and-hold benchmark
 ) -> dict[str, pd.DataFrame]:
     """
     Run a walk-forward backtest for all strategies simultaneously.
 
     Parameters
     ----------
-    prices        : Adjusted closing prices (T × N), any assets.
+    prices        : Adjusted closing prices (T × N), portfolio assets only.
+    spy_prices    : SPY price series aligned to prices.index — used as a
+                    pure buy-and-hold benchmark, never passed to the optimizer.
     lookback_days : Size of the estimation window in trading days.
     rebal_freq    : How often to reoptimize the portfolio.
     initial_value : Starting portfolio value in $.
@@ -89,13 +92,12 @@ def run_backtest(
     Returns
     -------
     dict mapping strategy name → DataFrame with columns:
-        date, portfolio_value, daily_return, weights_*
+        date, portfolio_value, daily_return
     """
     rebal_period = REBAL_DAYS[rebal_freq]
     tickers      = list(prices.columns)
     N            = len(tickers)
 
-    # We need at least lookback_days of history before we can start
     start_idx = lookback_days
     if start_idx >= len(prices):
         raise ValueError(
@@ -117,26 +119,37 @@ def run_backtest(
         "Equal Weight": {"weights": np.ones(N) / N, "value": initial_value},
     }
 
-    # Storage for results
+    # SPY buy-and-hold — aligned to the same start index
+    spy_value      = initial_value
+    spy_records    = []
+    spy_available  = spy_prices is not None and len(spy_prices) >= len(prices)
+
+    # Storage
     records: dict[str, list] = {s: [] for s in strategies}
     weight_records: dict[str, list] = {s: [] for s in strategies}
 
     # ── Walk-forward loop ─────────────────────────────────────────────────────
     for t in range(start_idx, len(prices)):
         date       = prices.index[t]
-        prev_date  = prices.index[t - 1]
 
         # Daily returns for each asset (t-1 → t)
-        daily_asset_returns = (
-            prices.iloc[t] / prices.iloc[t - 1] - 1
-        ).values
+        daily_asset_returns = (prices.iloc[t] / prices.iloc[t - 1] - 1).values
+
+        # ── SPY buy-and-hold return ───────────────────────────────────────────
+        if spy_available:
+            spy_ret   = float(spy_prices.iloc[t] / spy_prices.iloc[t - 1] - 1)
+            spy_value = spy_value * (1 + spy_ret)
+            spy_records.append({
+                "date":            date,
+                "portfolio_value": spy_value,
+                "daily_return":    spy_ret,
+            })
 
         # ── Rebalance check ───────────────────────────────────────────────────
         steps_since_start = t - start_idx
         should_rebalance  = (steps_since_start % rebal_period == 0)
 
         if should_rebalance:
-            # Estimation window: lookback_days of history ending yesterday
             window       = prices.iloc[t - lookback_days: t]
             win_returns  = compute_returns(window, save=False)
             cov_matrix   = compute_covariance_matrix(win_returns).values
@@ -173,7 +186,6 @@ def run_backtest(
             except Exception as e:
                 log.warning("Min Variance rebalance failed at %s: %s", date, e)
 
-            # Equal weight never changes
             strategies["Equal Weight"]["weights"] = np.ones(N) / N
 
         # ── Update portfolio values ───────────────────────────────────────────
@@ -189,7 +201,7 @@ def run_backtest(
                 "daily_return":    port_return,
             })
             weight_records[name].append(
-                {"date": date, **{f"w_{t}": w[i] for i, t in enumerate(tickers)}}
+                {"date": date, **{f"w_{tk}": w[i] for i, tk in enumerate(tickers)}}
             )
 
     # ── Package results ───────────────────────────────────────────────────────
@@ -198,6 +210,11 @@ def run_backtest(
         df = pd.DataFrame(records[name]).set_index("date")
         df.index = pd.to_datetime(df.index)
         results[name] = df
+
+    if spy_available and spy_records:
+        df_spy = pd.DataFrame(spy_records).set_index("date")
+        df_spy.index = pd.to_datetime(df_spy.index)
+        results["S&P 500 (SPY)"] = df_spy
 
     log.info("Backtest complete. Strategies: %s", list(results.keys()))
     return results, pd.DataFrame(weight_records["Max Sharpe"]).set_index("date")

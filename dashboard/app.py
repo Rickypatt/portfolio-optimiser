@@ -243,6 +243,7 @@ COLORS = {
     "mvp":      "#00ff9d",
     "max_sr":   "#ffd700",
     "eq_w":     "#ff4d6d",
+    "spy":      "#94a3b8",   # neutral grey — benchmark, not a strategy
     "accent":   "#00d4ff",
     "assets":   px.colors.qualitative.Pastel,
 }
@@ -1168,11 +1169,16 @@ with tab5:
     )
 
     with st.spinner("Running walk-forward backtest..."):
-        # Reuse the already-fetched prices from compute_all — no second download needed
-        bt_prices = returns.copy()
-        # Reconstruct price index from returns (cumulative product from 100)
         bt_prices_raw, _ = load_prices(tickers_key)
         bt_prices_raw = bt_prices_raw[[t for t in tickers if t in bt_prices_raw.columns]]
+
+        # Fetch SPY separately as benchmark — never included in optimizer
+        spy_series = None
+        if "SPY" not in tickers:
+            spy_raw, spy_failed = load_prices(("SPY",))
+            if not spy_failed and "SPY" in spy_raw.columns:
+                # Align SPY index to portfolio prices
+                spy_series = spy_raw["SPY"].reindex(bt_prices_raw.index).ffill()
 
         try:
             bt_results, bt_weights = run_backtest(
@@ -1186,6 +1192,7 @@ with tab5:
                 max_sector    = max_sector,
                 target_vol    = target_vol,
                 max_turnover  = max_turnover,
+                spy_prices    = spy_series,
             )
             bt_metrics  = compute_backtest_metrics(bt_results)
             bt_rolling  = compute_rolling_metrics(bt_results)
@@ -1222,21 +1229,23 @@ with tab5:
                     unsafe_allow_html=True)
 
         fig_eq = go.Figure()
-        for name, color in [
-            ("Max Sharpe",   COLORS["max_sr"]),
-            ("Min Variance", COLORS["mvp"]),
-            ("Equal Weight", COLORS["eq_w"]),
-        ]:
+        strategy_styles = [
+            ("Max Sharpe",   COLORS["max_sr"], "solid", 2),
+            ("Min Variance", COLORS["mvp"],    "solid", 2),
+            ("Equal Weight", COLORS["eq_w"],   "solid", 2),
+            ("S&P 500 (SPY)",COLORS["spy"],    "dash",  1.5),
+        ]
+        for name, color, dash, width in strategy_styles:
+            if name not in bt_results:
+                continue
             df = bt_results[name]
             fig_eq.add_trace(go.Scatter(
                 x    = df.index,
                 y    = df["portfolio_value"] / 1e6,
                 mode = "lines",
                 name = name,
-                line = dict(color=color, width=2),
-                hovertemplate = (
-                    f"<b>{name}</b><br>%{{x|%b %Y}}: $%{{y:.3f}}M<extra></extra>"
-                ),
+                line = dict(color=color, width=width, dash=dash),
+                hovertemplate = f"<b>{name}</b><br>%{{x|%b %Y}}: $%{{y:.3f}}M<extra></extra>",
             ))
 
         fig_eq.add_hline(y=1.0, line=dict(color="#334155", width=1, dash="dot"),
@@ -1256,17 +1265,20 @@ with tab5:
             st.markdown('<div class="section-header">Drawdown · Out-of-Sample</div>',
                         unsafe_allow_html=True)
             fig_dd = go.Figure()
-            for name, color in [
-                ("Max Sharpe",   COLORS["max_sr"]),
-                ("Min Variance", COLORS["mvp"]),
-                ("Equal Weight", COLORS["eq_w"]),
-            ]:
+            dd_styles = [
+                ("Max Sharpe",    COLORS["max_sr"], "255,215,0"),
+                ("Min Variance",  COLORS["mvp"],    "0,255,157"),
+                ("Equal Weight",  COLORS["eq_w"],   "255,77,109"),
+                ("S&P 500 (SPY)", COLORS["spy"],    "148,163,184"),
+            ]
+            for name, color, rgb in dd_styles:
+                if name not in bt_results:
+                    continue
                 dd = compute_drawdown_series(bt_results[name]["daily_return"]) * 100
-                _rgb = {"Max Sharpe":"255,215,0","Min Variance":"0,255,157","Equal Weight":"255,77,109"}
                 fig_dd.add_trace(go.Scatter(
                     x=dd.index, y=dd.values,
                     fill="tozeroy",
-                    fillcolor=f"rgba({_rgb[name]},0.1)",
+                    fillcolor=f"rgba({rgb},0.1)",
                     mode="lines", name=name,
                     line=dict(color=color, width=1.5),
                     hovertemplate=f"<b>{name}</b><br>%{{x|%b %Y}}: %{{y:.2f}}%<extra></extra>",
@@ -1281,10 +1293,13 @@ with tab5:
                         unsafe_allow_html=True)
             fig_rs = go.Figure()
             for name, color in [
-                ("Max Sharpe",   COLORS["max_sr"]),
-                ("Min Variance", COLORS["mvp"]),
-                ("Equal Weight", COLORS["eq_w"]),
+                ("Max Sharpe",    COLORS["max_sr"]),
+                ("Min Variance",  COLORS["mvp"]),
+                ("Equal Weight",  COLORS["eq_w"]),
+                ("S&P 500 (SPY)", COLORS["spy"]),
             ]:
+                if name not in bt_rolling:
+                    continue
                 rs = bt_rolling[name]["rolling_sharpe"]
                 fig_rs.add_trace(go.Scatter(
                     x=rs.index, y=rs.values,
