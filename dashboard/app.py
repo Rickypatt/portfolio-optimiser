@@ -269,47 +269,35 @@ def load_prices(tickers: tuple[str, ...]) -> tuple[pd.DataFrame, list[str]]:
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            raw = yf.download(
-                list(tickers),
-                start       = config.START_DATE,
-                end         = config.END_DATE,
-                auto_adjust = True,
-                progress    = False,
-                group_by    = "ticker",   # force consistent MultiIndex structure
-            )
+            # Download each ticker individually — more reliable on cloud IPs
+            # where Yahoo Finance may throttle batch requests
+            import time
+            frames = {}
+            for ticker in tickers:
+                for attempt in range(3):
+                    try:
+                        raw = yf.download(
+                            ticker,
+                            start       = config.START_DATE,
+                            end         = config.END_DATE,
+                            auto_adjust = True,
+                            progress    = False,
+                        )
+                        if not raw.empty:
+                            col = "Close" if "Close" in raw.columns else raw.columns[0]
+                            frames[ticker] = raw[col]
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(1 * (attempt + 1))
 
-        if raw.empty:
-            raise ValueError("yfinance returned empty data")
+            if not frames:
+                raise ValueError("yfinance returned empty data for all tickers")
 
-        # ── Robust price extraction across all yfinance versions ─────────────
-        if isinstance(raw.columns, pd.MultiIndex):
-            level_0 = raw.columns.get_level_values(0).unique().tolist()
-            level_1 = raw.columns.get_level_values(1).unique().tolist()
+            raw = pd.DataFrame(frames)
 
-            # group_by="ticker" → (Ticker, PriceType): e.g. ('MSFT', 'Close')
-            if any(t in level_0 for t in tickers):
-                prices = pd.DataFrame({
-                    t: raw[t]["Close"]
-                    for t in tickers
-                    if t in level_0 and "Close" in raw[t].columns
-                })
-            # default yfinance → (PriceType, Ticker): e.g. ('Close', 'MSFT')
-            elif "Close" in level_0:
-                prices = raw["Close"].copy()
-            elif "Price" in level_0:
-                prices = raw["Price"].copy()
-            else:
-                # last resort — grab whatever the first price-like level is
-                prices = raw.iloc[:, raw.columns.get_level_values(1) == "Close"]
-                prices.columns = prices.columns.get_level_values(0)
-        else:
-            # single ticker — flat columns
-            col = next((c for c in ["Close", "Price"] if c in raw.columns), None)
-            if col is None:
-                raise ValueError(f"No Close column found. Columns: {raw.columns.tolist()}")
-            prices = raw[[col]].copy()
-            prices.columns = list(tickers)
-
+        # prices DataFrame already built correctly above — just clean it
+        prices = raw.copy()
         prices.index = pd.to_datetime(prices.index)
         prices = prices.dropna(axis=1, how="all")
 
